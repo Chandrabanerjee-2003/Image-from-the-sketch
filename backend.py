@@ -1,4 +1,9 @@
-import io, base64, torch, uvicorn, threading
+import io
+import os
+import base64
+import torch
+import uvicorn
+import logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,8 +13,9 @@ from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from groq import Groq
 
-# --- CONFIG ---
-GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE"
+# Setup Logging so you can see exactly what's happening
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("DynamicBackend")
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -17,77 +23,108 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class ImagePayload(BaseModel):
     image_base64: str
 
-# Global State
-sd_pipe = None
-model_ready = False
-status_msg = "Server is starting... please wait."
-groq_client = Groq(api_key=GROQ_API_KEY)
+# --- CONFIGURATION (Change these via environment variables if needed) ---
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_ACTUAL_GROQ_KEY_HERE")
+MODEL_REPO = "ByteDance/SDXL-Lightning"
+MODEL_CKPT = "sdxl_lightning_4step_unet.safetensors"
+BASE_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
 
-# This function loads the heavy AI in the background
-def load_ai_model():
-    global sd_pipe, model_ready, status_msg
+# Global Variables
+pipe = None
+client = Groq(api_key=GROQ_API_KEY)
+is_loading = True
+
+def get_optimal_device():
+    if torch.cuda.is_available(): return "cuda", torch.float16
+    if torch.backends.mps.is_available(): return "mps", torch.float32 # For Mac M1/M2/M3
+    return "cpu", torch.float32
+
+def initialize_models():
+    global pipe, is_loading
+    device_name, dtype = get_optimal_device()
+    logger.info(f"Initializing AI on device: {device_name}")
+    
     try:
-        print("--- [STARTING] Loading AI Model in background ---")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        # Load UNet
+        unet = UNet2DConditionModel.from_config(BASE_MODEL, subfolder="unet").to(device_name, dtype)
+        unet.load_state_dict(load_file(hf_hub_download(MODEL_REPO, MODEL_CKPT), device=device_name))
         
-        base = "stabilityai/stable-diffusion-xl-base-1.0"
-        repo = "ByteDance/SDXL-Lightning"
-        ckpt = "sdxl_lightning_4step_unet.safetensors"
-
-        unet = UNet2DConditionModel.from_config(base, subfolder="unet").to(device, dtype)
-        unet.load_state_dict(load_file(hf_hub_download(repo, ckpt), device=device))
-
-        sd_pipe = StableDiffusionXLPipeline.from_pretrained(
-            base, unet=unet, torch_dtype=dtype, variant="fp16" if device == "cuda" else None
-        ).to(device)
-
-        sd_pipe.scheduler = EulerDiscreteScheduler.from_config(sd_pipe.scheduler.config, timestep_spacing="trailing")
+        # Load Pipeline
+        pipe = StableDiffusionXLPipeline.from_pretrained(
+            BASE_MODEL, 
+            unet=unet, 
+            torch_dtype=dtype, 
+            use_safetensors=True
+        ).to(device_name)
         
-        model_ready = True
-        status_msg = "READY"
-        print("--- [SUCCESS] AI Model Loaded and Ready! ---")
+        pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
+        
+        # Performance optimization
+        if device_name == "cuda":
+            pipe.enable_xformers_memory_efficient_attention()
+            
+        is_loading = False
+        logger.info("✨ AI Models loaded and ready to generate!")
     except Exception as e:
-        status_msg = f"ERROR: {str(e)}"
-        print(f"--- [FAILED] {status_msg} ---")
+        logger.error(f"Failed to load models: {e}")
+        is_loading = False
 
-# Start loading WITHOUT blocking the server
-threading.Thread(target=load_ai_model).start()
+@app.on_event("startup")
+async def startup_event():
+    # Run initialization in a separate thread so the server starts IMMEDIATELY
+    import threading
+    threading.Thread(target=initialize_models).start()
 
-@app.get("/")
-def check_status():
-    return {"status": status_msg, "ready": model_ready}
+@app.get("/health")
+def health():
+    return {"status": "online", "ai_ready": pipe is not None}
 
 @app.post("/process")
 async def process(payload: ImagePayload):
-    if not model_ready:
-        # This tells the frontend exactly why it's not working yet
-        raise HTTPException(status_code=503, detail=status_msg)
-    
+    if pipe is None:
+        raise HTTPException(status_code=503, detail="AI model is still loading. Please wait 30 seconds.")
+
     try:
-        # 1. Vision
-        img_data = base64.b64decode(payload.image_base64.split(",")[-1])
-        input_img = Image.open(io.BytesIO(img_data)).convert("RGB")
-        buf = io.BytesIO(); input_img.save(buf, format="JPEG")
-        b64_img = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        chat = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": "Describe this sketch for a digital painting in 15 words. Mention colors."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-            ]}],
-            model="llama-3.2-11b-vision-preview",
-        )
-        prompt = chat.choices[0].message.content
-        print(f"Prompt: {prompt}")
-
-        # 2. Generation
-        output = sd_pipe(prompt, num_inference_steps=4, guidance_scale=0).images[0]
+        # Clean up image string
+        img_str = payload.image_base64.split(",")[-1]
+        raw_img = Image.open(io.BytesIO(base64.b64decode(img_str))).convert("RGB")
         
-        out_buf = io.BytesIO(); output.save(out_buf, format="JPEG")
-        return {"generated_image_base64": base64.b64encode(out_buf.getvalue()).decode("utf-8")}
+        # Step 1: Vision Analysis (Dynamic prompt generation)
+        logger.info("Analyzing drawing with Vision...")
+        buf = io.BytesIO()
+        raw_img.save(buf, format="JPEG")
+        b64_vision = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        try:
+            chat = client.chat.completions.create(
+                model="llama-3.2-11b-vision-preview",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "What is this? Describe it as a beautiful detailed digital painting in 15 words."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_vision}"}}
+                ]}]
+            )
+            prompt = chat.choices[0].message.content
+        except Exception as v_err:
+            logger.warning(f"Vision failed, using default prompt: {v_err}")
+            prompt = "A high-quality digital painting of the user's sketch, masterpiece, vibrant colors"
+
+        logger.info(f"Generating with prompt: {prompt}")
+
+        # Step 2: Image Generation
+        # The num_inference_steps is set to 4 to match the SDXL-Lightning 4-step unet
+        output = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=0).images[0]
+
+        # Step 3: Encode and Return
+        out_buf = io.BytesIO()
+        output.save(out_buf, format="JPEG")
+        encoded_res = base64.b64encode(out_buf.getvalue()).decode("utf-8")
+
+        return {"generated_image_base64": encoded_res}
+
     except Exception as e:
+        logger.error(f"Process error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
+    # Dynamically find an open port or use 8000
     uvicorn.run(app, host="0.0.0.0", port=8000)

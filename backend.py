@@ -9,9 +9,8 @@ from safetensors.torch import load_file
 from groq import Groq
 
 # ==========================================
-# 1. SET YOUR API KEY HERE
+GROQ_API_KEY = "YOUR_GROQ_KEY_HERE" 
 # ==========================================
-GROQ_API_KEY = "PASTE_YOUR_GROQ_KEY_HERE" 
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -19,15 +18,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 class ImagePayload(BaseModel):
     image_base64: str
 
-# Global Variables
 pipe = None
 client = Groq(api_key=GROQ_API_KEY)
 
 def load_model():
     global pipe
-    print("--- Loading AI Model (This may take a while) ---")
+    print("\n[1/3] Starting Model Load... (Please wait, this takes a moment)")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use float16 only if using CUDA (GPU) to save memory
     dtype = torch.float16 if device == "cuda" else torch.float32
     
     try:
@@ -35,17 +32,19 @@ def load_model():
         repo = "ByteDance/SDXL-Lightning"
         ckpt = "sdxl_lightning_4step_unet.safetensors"
 
+        print(f"[2/3] Loading UNet to {device}...")
         unet = UNet2DConditionModel.from_config(base, subfolder="unet").to(device, dtype)
         unet.load_state_dict(load_file(hf_hub_download(repo, ckpt), device=device))
         
+        print("[3/3] Finalizing Pipeline...")
         pipe = StableDiffusionXLPipeline.from_pretrained(
             base, unet=unet, torch_dtype=dtype, variant="fp16"
         ).to(device)
         
         pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing")
-        print(f"--- SUCCESS: Model loaded on {device} ---")
+        print("\n✨✨✨ SERVER IS READY! You can draw now. ✨✨✨\n")
     except Exception as e:
-        print(f"--- ERROR LOADING MODEL: {e} ---")
+        print(f"\n❌ FATAL ERROR: {e}")
 
 @app.on_event("startup")
 async def startup():
@@ -54,15 +53,14 @@ async def startup():
 @app.post("/process")
 async def process(payload: ImagePayload):
     if pipe is None:
-        return {"error": "Model failed to load. Check your terminal/GPU memory."}
+        return {"error": "Server is still loading the AI. Please wait 1 minute and try again."}
     
     try:
         # Decode Drawing
         img_data = base64.b64decode(payload.image_base64.split(",")[-1])
         input_img = Image.open(io.BytesIO(img_data)).convert("RGB")
 
-        # Step 1: Vision Model (Groq)
-        print("Asking Groq to describe drawing...")
+        # Step 1: Vision (Groq)
         img_byte_arr = io.BytesIO()
         input_img.save(img_byte_arr, format='JPEG')
         b64_img = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
@@ -70,25 +68,22 @@ async def process(payload: ImagePayload):
         completion = client.chat.completions.create(
             model="llama-3.2-11b-vision-preview",
             messages=[{"role": "user", "content": [
-                {"type": "text", "text": "Describe this sketch in 15 words for a realistic digital art prompt."},
+                {"type": "text", "text": "Describe this sketch artistically in 15 words. Mention colors."},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
             ]}]
         )
         prompt = completion.choices[0].message.content
-        print(f"Prompt Generated: {prompt}")
+        print(f"AI Prompt: {prompt}")
 
-        # Step 2: Image Generation
-        print("Generating Image...")
-        # Use simple settings to avoid crash
+        # Step 2: Generation
         output = pipe(prompt, num_inference_steps=4, guidance_scale=0).images[0]
         
-        # Encode Result
         buf = io.BytesIO()
         output.save(buf, format="JPEG")
         return {"image": base64.b64encode(buf.getvalue()).decode('utf-8'), "prompt": prompt}
 
     except Exception as e:
-        print(f"Processing Error: {e}")
+        print(f"Error: {e}")
         return {"error": str(e)}
 
 if __name__ == "__main__":
